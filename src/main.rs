@@ -409,6 +409,82 @@ async fn admin_send(State(state): State<AppState>, headers: HeaderMap, Json(body
     Json(json!({"ok": true, "started": true, "message": format!("Sending \"{slug}\" to confirmed subscribers.")})).into_response()
 }
 
+#[derive(Deserialize)]
+struct ComposeSeedBody {
+    #[serde(default)]
+    slug: String,
+}
+
+async fn admin_compose(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ComposeSeedBody>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+    match send::read_post(&state.cfg, &body.slug) {
+        Ok((_slug, title, desc, post_url)) => {
+            let seed = send::seed_body(&title, &desc, &post_url);
+            Json(json!({"ok": true, "subject": title, "body_html": seed})).into_response()
+        }
+        Err(e) => jerr(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    #[serde(default)]
+    body_html: String,
+}
+
+async fn admin_preview(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<PreviewBody>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let unsub = format!("{}/unsubscribe?token=preview", state.cfg.public_url.trim_end_matches('/'));
+    let (html, _text) = mail::wrap_custom(&body.body_html, &unsub);
+    Html(html).into_response()
+}
+
+#[derive(Deserialize)]
+struct SendHtmlBody {
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body_html: String,
+    #[serde(default)]
+    test_email: String,
+}
+
+async fn admin_send_html(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<SendHtmlBody>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+    if body.subject.trim().is_empty() {
+        return jerr(StatusCode::BAD_REQUEST, "Subject is required.");
+    }
+    if body.body_html.trim().is_empty() {
+        return jerr(StatusCode::BAD_REQUEST, "The email body is empty.");
+    }
+    let test = body.test_email.trim().to_string();
+    if !test.is_empty() {
+        if !valid_email(&test) {
+            return jerr(StatusCode::BAD_REQUEST, "Invalid test address.");
+        }
+        return match send::send_test(&state, &body.subject, &body.body_html, &test).await {
+            Ok(_) => Json(json!({"ok": true, "message": format!("Test email sent to {test}.")})).into_response(),
+            Err(e) => jerr(StatusCode::BAD_GATEWAY, &format!("Test send failed: {e}")),
+        };
+    }
+    let st = state.clone();
+    let subject = body.subject.clone();
+    let bh = body.body_html.clone();
+    tokio::spawn(async move {
+        match send::send_custom(&st, &subject, &bh).await {
+            Ok(r) => tracing::info!("compose send '{}': sent {}, failed {} of {}", subject, r.sent, r.failed, r.recipients),
+            Err(e) => tracing::error!("compose send failed: {e}"),
+        }
+    });
+    Json(json!({"ok": true, "started": true, "message": "Sending to confirmed subscribers."})).into_response()
+}
+
 fn config_from_env() -> Config {
     let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let resend = std::env::var("RESEND_API_KEY")
@@ -496,7 +572,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/unsubscribe", post(admin_unsub))
         .route("/admin/delete", post(admin_delete))
         .route("/admin/send", post(admin_send))
-        .layer(DefaultBodyLimit::max(16 * 1024))
+        .route("/admin/compose", post(admin_compose))
+        .route("/admin/preview", post(admin_preview))
+        .route("/admin/send_html", post(admin_send_html))
+        .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(cors)
         .with_state(state);
 

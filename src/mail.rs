@@ -100,6 +100,46 @@ pub fn post_email(title: &str, desc: &str, post_url: &str, unsub_url: &str) -> (
     (html, text)
 }
 
+/// Crude HTML -> text: drop tags, collapse whitespace. For the text/plain part.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let decoded = out
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Wrap a custom composed body (from the WYSIWYG editor) in the standard email
+/// container and unsubscribe footer. Returns (html, text).
+pub fn wrap_custom(body_html: &str, unsub_url: &str) -> (String, String) {
+    let u = esc(unsub_url);
+    let html = format!(
+        r#"<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:16px;line-height:1.6;color:#181512;max-width:560px;">
+  {body_html}
+  <hr style="border:none;border-top:1px solid #d6d1c9;margin:24px 0;">
+  <p style="color:#8a8178;font-size:12px;margin:0;">
+    You're receiving this because you subscribed at stephens.page/blog.
+    <a href="{u}" style="color:#8a8178;">Unsubscribe</a>.
+  </p>
+</div>"#
+    );
+    let text = format!("{}\n\n---\nUnsubscribe: {}\n", strip_tags(body_html), unsub_url);
+    (html, text)
+}
+
 /// Branded landing page (confirm / unsubscribe screens), mirrors the blog style.
 pub fn landing_page(title: &str, heading: &str, body_html: &str) -> String {
     format!(
