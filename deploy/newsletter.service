@@ -1,0 +1,17 @@
+[Unit]
+Description=Newsletter service for stephens.page/blog (Rust/Axum)
+After=network.target
+
+[Service]
+Type=simple
+User=jacob
+Group=jacob
+WorkingDirectory=/var/www/newsletter.stephens.page
+EnvironmentFile=/var/www/newsletter.stephens.page/.env
+# secret-env decrypts the shared fleet secret and injects SMTP_PASS (the Resend key).
+ExecStart=/usr/local/bin/secret-env /etc/shared-secrets/smtp.env.sops /var/www/newsletter.stephens.page/target/release/newsletter
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
