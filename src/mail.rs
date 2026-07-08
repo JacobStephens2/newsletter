@@ -140,6 +140,79 @@ pub fn wrap_custom(body_html: &str, unsub_url: &str) -> (String, String) {
     (html, text)
 }
 
+/// Standalone subscribe page served at the service root (newsletter.stephens.page/).
+pub fn subscribe_page(sitekey: &str) -> String {
+    let k = esc(sitekey);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="icon" type="image/png" href="https://stephens.page/bee-favicon.png">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Subscribe | Jacob Stephens' blog</title>
+<meta name="description" content="Subscribe to get new posts from Jacob Stephens' blog by email.">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@600;700&family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<style>
+:root{{--ink:#181512;--brand:#9b4d24;--muted:#625a52;--surface:#fff;--soft:#efe9df;--rule:#d6d1c9;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{font-family:'Source Sans 3',Arial,sans-serif;background:var(--surface);color:var(--ink);line-height:1.7;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.5rem;}}
+.card{{max-width:480px;width:100%;}}
+.eyebrow{{color:var(--brand);font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.6rem;}}
+h1{{font-family:'Source Serif 4',Georgia,serif;font-weight:700;font-size:clamp(1.8rem,4vw,2.4rem);line-height:1.1;margin-bottom:.6rem;}}
+p.lead{{color:var(--muted);margin-bottom:1.4rem;}}
+form{{display:flex;flex-direction:column;gap:.8rem;}}
+.row{{display:flex;gap:.6rem;flex-wrap:wrap;}}
+input[type=email]{{flex:1 1 220px;padding:.65rem .8rem;font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--rule);border-radius:6px;}}
+input[type=email]:focus-visible{{outline:2px solid var(--brand);outline-offset:1px;border-color:var(--brand);}}
+button{{padding:.65rem 1.3rem;font:inherit;font-weight:700;color:#fff;background:var(--brand);border:1px solid var(--brand);border-radius:6px;cursor:pointer;}}
+button:hover:not(:disabled){{background:#843f1d;}}
+button:disabled{{opacity:.6;cursor:default;}}
+.hp{{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden;}}
+.status{{font-size:.95rem;min-height:1.2em;margin:0;}}
+.status.ok{{color:#2f6b34;}}
+.status.err{{color:#a3372a;}}
+.fine{{color:var(--muted);font-size:.82rem;margin:0;}}
+.foot{{margin-top:1.6rem;font-size:.85rem;}}
+a{{color:var(--brand);}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="eyebrow">Jacob Stephens' blog</div>
+  <h1>Get new posts by email</h1>
+  <p class="lead">Occasional engineering writeups, sent when I publish. No spam, unsubscribe anytime.</p>
+  <form id="f" novalidate>
+    <div class="row">
+      <input type="email" name="email" id="email" placeholder="you@example.com" autocomplete="email" required aria-label="Email address">
+      <button type="submit" id="btn">Subscribe</button>
+    </div>
+    <div class="hp" aria-hidden="true"><label>Leave this field empty<input type="text" name="website_url" tabindex="-1" autocomplete="off"></label></div>
+    <div class="cf-turnstile" data-sitekey="{k}" data-theme="light"></div>
+    <p class="status" id="status" role="status" aria-live="polite"></p>
+    <p class="fine">You'll get a confirmation email to opt in, and every email has a one-click unsubscribe.</p>
+  </form>
+  <p class="foot"><a href="https://stephens.page/blog/">&larr; Read the blog</a></p>
+</div>
+<script>
+(function(){{
+  var f=document.getElementById('f'),btn=document.getElementById('btn'),s=document.getElementById('status');
+  f.addEventListener('submit',function(e){{
+    e.preventDefault();s.className='status';s.textContent='';btn.disabled=true;btn.textContent='Subscribing...';
+    fetch('/subscribe',{{method:'POST',body:new URLSearchParams(new FormData(f))}})
+      .then(function(r){{return r.json().catch(function(){{return {{ok:false,message:'Unexpected response.'}};}});}})
+      .then(function(j){{s.textContent=j.message||(j.ok?'Thanks!':'Something went wrong.');s.className='status '+(j.ok?'ok':'err');if(j.ok){{f.reset();}}}})
+      .catch(function(){{s.textContent='Network error. Please try again.';s.className='status err';}})
+      .finally(function(){{btn.disabled=false;btn.textContent='Subscribe';if(window.turnstile){{try{{window.turnstile.reset();}}catch(e){{}}}}}});
+  }});
+}})();
+</script>
+</body>
+</html>"#
+    )
+}
+
 /// Branded landing page (confirm / unsubscribe screens), mirrors the blog style.
 pub fn landing_page(title: &str, heading: &str, body_html: &str) -> String {
     format!(

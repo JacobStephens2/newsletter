@@ -44,6 +44,7 @@ pub struct Config {
     pub blog_dir: String,
     pub resend_key: String,
     pub turnstile_secret: String,
+    pub turnstile_sitekey: String,
     pub admin_token: String,
     pub from_email: String,
     pub from_name: String,
@@ -157,6 +158,10 @@ fn admin_ok(headers: &HeaderMap, token: &str) -> bool {
 }
 
 // ---------- Public handlers ----------
+
+async fn index(State(state): State<AppState>) -> Html<String> {
+    Html(mail::subscribe_page(&state.cfg.turnstile_sitekey))
+}
 
 #[derive(Deserialize)]
 struct SubscribeForm {
@@ -552,6 +557,7 @@ fn config_from_env() -> Config {
         blog_dir: get("NEWSLETTER_BLOG_DIR", "/var/www/stephens.page/blog"),
         resend_key: resend,
         turnstile_secret: get("TURNSTILE_SECRET", ""),
+        turnstile_sitekey: get("TURNSTILE_SITE_KEY", "0x4AAAAAADk4Vi9kg773i1pu"),
         admin_token: get("NEWSLETTER_ADMIN_TOKEN", ""),
         from_email: get("NEWSLETTER_FROM_EMAIL", "jacob@stephens.page"),
         from_name: get("NEWSLETTER_FROM_NAME", "Jacob Stephens"),
@@ -618,6 +624,7 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods([Method::GET, Method::POST]);
 
     let app = Router::new()
+        .route("/", get(index))
         .route("/health", get(|| async { "ok" }))
         .route("/subscribe", post(subscribe))
         .route("/confirm", get(confirm))
