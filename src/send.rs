@@ -97,11 +97,39 @@ pub async fn send_post(state: &AppState, slug: &str, force: bool) -> anyhow::Res
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
+    let preview_unsub = format!("{}/unsubscribe?token=preview", state.cfg.public_url.trim_end_matches('/'));
+    let repr_html = mail::post_email(&title, &desc, &post_url, &preview_unsub).0;
     {
         let conn = state.db.lock().unwrap();
-        crate::db::record_send(&conn, &post_url, &subject, crate::now(), sent as i64)?;
+        crate::db::record_send(&conn, &post_url, &subject, crate::now(), sent as i64, &repr_html)?;
     }
     Ok(SendResult { sent, failed, subject, recipients: recipients.len() })
+}
+
+/// List published posts available to send, as (slug, title). Sorted by title.
+pub fn list_posts(cfg: &Config) -> Vec<(String, String)> {
+    let mut posts = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&cfg.blog_dir) {
+        for e in entries.flatten() {
+            let slug = e.file_name().to_string_lossy().to_string();
+            if slug.is_empty() || !slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                continue;
+            }
+            let idx = e.path().join("index.html");
+            if !idx.is_file() {
+                continue;
+            }
+            let title = std::fs::read_to_string(&idx)
+                .ok()
+                .and_then(|h| between(&h, "<title>", "</title>").map(str::to_string))
+                .map(|t| unescape(t.trim()).trim_end_matches("| Jacob Stephens").trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| slug.clone());
+            posts.push((slug, title));
+        }
+    }
+    posts.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    posts
 }
 
 /// Send a custom composed email (HTML body from the WYSIWYG editor) to all confirmed
@@ -127,9 +155,11 @@ pub async fn send_custom(state: &AppState, subject: &str, body_html: &str) -> an
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+    let preview_unsub = format!("{}/unsubscribe?token=preview", state.cfg.public_url.trim_end_matches('/'));
+    let repr_html = mail::wrap_custom(body_html, &preview_unsub).0;
     {
         let conn = state.db.lock().unwrap();
-        crate::db::record_send(&conn, &format!("(compose) {subject}"), subject, crate::now(), sent as i64)?;
+        crate::db::record_send(&conn, &format!("(compose) {subject}"), subject, crate::now(), sent as i64, &repr_html)?;
     }
     Ok(SendResult { sent, failed, subject: subject.to_string(), recipients: recipients.len() })
 }

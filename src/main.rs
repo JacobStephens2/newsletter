@@ -485,6 +485,60 @@ async fn admin_send_html(State(state): State<AppState>, headers: HeaderMap, Json
     Json(json!({"ok": true, "started": true, "message": "Sending to confirmed subscribers."})).into_response()
 }
 
+async fn admin_add(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<EmailBody>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+    let email = body.email.trim().to_string();
+    if !valid_email(&email) {
+        return jerr(StatusCode::BAD_REQUEST, "Please enter a valid email address.");
+    }
+    let outcome = {
+        let conn = state.db.lock().unwrap();
+        db::add_confirmed(&conn, &email, &token(), now())
+    };
+    match outcome {
+        Ok(db::AddOutcome::AlreadyConfirmed) => Json(json!({"ok": true, "message": format!("{email} is already subscribed.")})).into_response(),
+        Ok(db::AddOutcome::Reactivated) => Json(json!({"ok": true, "message": format!("Re-added {email} as confirmed.")})).into_response(),
+        Ok(db::AddOutcome::Added) => Json(json!({"ok": true, "message": format!("Added {email} as confirmed.")})).into_response(),
+        Err(e) => {
+            tracing::error!("admin add: {e}");
+            jerr(StatusCode::INTERNAL_SERVER_ERROR, "Could not add subscriber.")
+        }
+    }
+}
+
+async fn admin_posts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+    let posts: Vec<_> = send::list_posts(&state.cfg)
+        .into_iter()
+        .map(|(slug, title)| json!({"slug": slug, "title": title}))
+        .collect();
+    Json(json!({"posts": posts})).into_response()
+}
+
+#[derive(Deserialize)]
+struct IdQuery {
+    #[serde(default)]
+    id: i64,
+}
+
+async fn admin_sent(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<IdQuery>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let html = {
+        let conn = state.db.lock().unwrap();
+        db::sent_html(&conn, q.id).ok().flatten()
+    };
+    match html {
+        Some(h) => Html(h).into_response(),
+        None => (StatusCode::NOT_FOUND, Html("<p style=\"font-family:sans-serif\">No stored copy of that email.</p>".to_string())).into_response(),
+    }
+}
+
 fn config_from_env() -> Config {
     let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let resend = std::env::var("RESEND_API_KEY")
@@ -575,6 +629,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/compose", post(admin_compose))
         .route("/admin/preview", post(admin_preview))
         .route("/admin/send_html", post(admin_send_html))
+        .route("/admin/add", post(admin_add))
+        .route("/admin/posts", get(admin_posts))
+        .route("/admin/sent", get(admin_sent))
         .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(cors)
         .with_state(state);

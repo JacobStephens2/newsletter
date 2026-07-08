@@ -28,10 +28,18 @@ pub struct Stats {
 /// A recorded send (one blast of a post).
 #[derive(Debug, Serialize)]
 pub struct SendRecord {
+    pub id: i64,
     pub post_url: String,
     pub subject: Option<String>,
     pub sent_at: i64,
     pub recipient_count: Option<i64>,
+}
+
+/// Outcome of a manual admin add.
+pub enum AddOutcome {
+    Added,
+    Reactivated,
+    AlreadyConfirmed,
 }
 
 /// Open the database and create the schema if needed.
@@ -61,7 +69,39 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
         );
         "#,
     )?;
+    // Migration: store a representative copy of the sent email so it can be viewed
+    // later. Ignore the "duplicate column" error on subsequent startups.
+    let _ = conn.execute("ALTER TABLE sends ADD COLUMN body_html TEXT", []);
     Ok(conn)
+}
+
+/// Manually add a subscriber as already-confirmed (admin vouches for them).
+pub fn add_confirmed(conn: &Connection, email: &str, unsubscribe_token: &str, now: i64) -> rusqlite::Result<AddOutcome> {
+    match find_by_email(conn, email)? {
+        Some((_, status)) if status == "confirmed" => Ok(AddOutcome::AlreadyConfirmed),
+        Some((id, _)) => {
+            conn.execute(
+                "UPDATE subscribers SET status='confirmed', confirmed_at=?1, confirm_token=NULL, unsubscribed_at=NULL WHERE id=?2",
+                rusqlite::params![now, id],
+            )?;
+            Ok(AddOutcome::Reactivated)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO subscribers (email, status, confirm_token, unsubscribe_token, created_at, confirmed_at, ip)
+                 VALUES (?1, 'confirmed', NULL, ?2, ?3, ?3, 'admin')",
+                rusqlite::params![email, unsubscribe_token, now],
+            )?;
+            Ok(AddOutcome::Added)
+        }
+    }
+}
+
+/// The stored HTML of a recorded send, for viewing.
+pub fn sent_html(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT body_html FROM sends WHERE id = ?", [id], |r| r.get::<_, Option<String>>(0))
+        .optional()
+        .map(|o| o.flatten())
 }
 
 /// Existing subscriber lookup result: (id, status).
@@ -204,14 +244,15 @@ pub fn confirmed_recipients(conn: &Connection) -> rusqlite::Result<Vec<(String, 
 /// Recent send history.
 pub fn recent_sends(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<SendRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT post_url, subject, sent_at, recipient_count FROM sends ORDER BY sent_at DESC LIMIT ?",
+        "SELECT id, post_url, subject, sent_at, recipient_count FROM sends ORDER BY sent_at DESC LIMIT ?",
     )?;
     let rows = stmt.query_map([limit], |r| {
         Ok(SendRecord {
-            post_url: r.get(0)?,
-            subject: r.get(1)?,
-            sent_at: r.get(2)?,
-            recipient_count: r.get(3)?,
+            id: r.get(0)?,
+            post_url: r.get(1)?,
+            subject: r.get(2)?,
+            sent_at: r.get(3)?,
+            recipient_count: r.get(4)?,
         })
     })?;
     rows.collect()
@@ -227,11 +268,11 @@ pub fn last_send_at(conn: &Connection, post_url: &str) -> rusqlite::Result<Optio
     .optional()
 }
 
-/// Record a completed send.
-pub fn record_send(conn: &Connection, post_url: &str, subject: &str, now: i64, count: i64) -> rusqlite::Result<()> {
+/// Record a completed send, storing a representative copy of the email HTML.
+pub fn record_send(conn: &Connection, post_url: &str, subject: &str, now: i64, count: i64, body_html: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO sends (post_url, subject, sent_at, recipient_count) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![post_url, subject, now, count],
+        "INSERT INTO sends (post_url, subject, sent_at, recipient_count, body_html) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![post_url, subject, now, count, body_html],
     )?;
     Ok(())
 }
