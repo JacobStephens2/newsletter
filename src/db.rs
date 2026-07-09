@@ -1,12 +1,12 @@
 //! SQLite persistence for the newsletter service.
 //!
-//! Single owner: this service is the only process that touches the database,
-//! which avoids the cross-user / WAL sharing problems of the old PHP setup.
+//! Multi-list: one service backs several blogs. Every subscriber and send belongs
+//! to a `list` (e.g. "stephens", "personal"); the same email may be on more than
+//! one list, so uniqueness is (email, list). This service is the sole DB owner.
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
-/// A subscriber row as exposed to the admin API.
 #[derive(Debug, Serialize)]
 pub struct Subscriber {
     pub email: String,
@@ -16,7 +16,6 @@ pub struct Subscriber {
     pub unsubscribed_at: Option<i64>,
 }
 
-/// Aggregate counts for the manager page.
 #[derive(Debug, Serialize, Default)]
 pub struct Stats {
     pub confirmed: i64,
@@ -25,7 +24,6 @@ pub struct Stats {
     pub total: i64,
 }
 
-/// A recorded send (one blast of a post).
 #[derive(Debug, Serialize)]
 pub struct SendRecord {
     pub id: i64,
@@ -35,14 +33,31 @@ pub struct SendRecord {
     pub recipient_count: Option<i64>,
 }
 
-/// Outcome of a manual admin add.
 pub enum AddOutcome {
     Added,
     Reactivated,
     AlreadyConfirmed,
 }
 
-/// Open the database and create the schema if needed.
+pub enum UnsubOutcome {
+    Done,
+    Already,
+    NotFound,
+}
+
+fn table_has_column(conn: &Connection, table: &str, col: &str) -> bool {
+    let mut stmt = match conn.prepare(&format!("PRAGMA table_info({table})")) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    cols.iter().any(|c| c == col)
+}
+
+/// Open the database, create the schema, and run the multi-list migration.
 pub fn open(path: &str) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -51,14 +66,16 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
         r#"
         CREATE TABLE IF NOT EXISTS subscribers (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            email             TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            email             TEXT NOT NULL COLLATE NOCASE,
             status            TEXT NOT NULL DEFAULT 'pending',
             confirm_token     TEXT,
             unsubscribe_token TEXT NOT NULL,
             created_at        INTEGER NOT NULL,
             confirmed_at      INTEGER,
             unsubscribed_at   INTEGER,
-            ip                TEXT
+            ip                TEXT,
+            list              TEXT NOT NULL DEFAULT 'stephens',
+            UNIQUE(email, list)
         );
         CREATE TABLE IF NOT EXISTS sends (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,98 +86,73 @@ pub fn open(path: &str) -> anyhow::Result<Connection> {
         );
         "#,
     )?;
-    // Migration: store a representative copy of the sent email so it can be viewed
-    // later. Ignore the "duplicate column" error on subsequent startups.
+
+    // Migration: sends gains list + body_html; subscribers gains list (+ composite
+    // uniqueness). Guarded so it only runs on the pre-multi-list schema.
     let _ = conn.execute("ALTER TABLE sends ADD COLUMN body_html TEXT", []);
+    let _ = conn.execute("ALTER TABLE sends ADD COLUMN list TEXT NOT NULL DEFAULT 'stephens'", []);
+    if !table_has_column(&conn, "subscribers", "list") {
+        conn.execute_batch(
+            r#"
+            BEGIN;
+            ALTER TABLE subscribers RENAME TO subscribers_old;
+            CREATE TABLE subscribers (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                email             TEXT NOT NULL COLLATE NOCASE,
+                status            TEXT NOT NULL DEFAULT 'pending',
+                confirm_token     TEXT,
+                unsubscribe_token TEXT NOT NULL,
+                created_at        INTEGER NOT NULL,
+                confirmed_at      INTEGER,
+                unsubscribed_at   INTEGER,
+                ip                TEXT,
+                list              TEXT NOT NULL DEFAULT 'stephens',
+                UNIQUE(email, list)
+            );
+            INSERT INTO subscribers (id,email,status,confirm_token,unsubscribe_token,created_at,confirmed_at,unsubscribed_at,ip,list)
+                SELECT id,email,status,confirm_token,unsubscribe_token,created_at,confirmed_at,unsubscribed_at,ip,'stephens' FROM subscribers_old;
+            DROP TABLE subscribers_old;
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(conn)
 }
 
-/// Manually add a subscriber as already-confirmed (admin vouches for them).
-pub fn add_confirmed(conn: &Connection, email: &str, unsubscribe_token: &str, now: i64) -> rusqlite::Result<AddOutcome> {
-    match find_by_email(conn, email)? {
-        Some((_, status)) if status == "confirmed" => Ok(AddOutcome::AlreadyConfirmed),
-        Some((id, _)) => {
-            conn.execute(
-                "UPDATE subscribers SET status='confirmed', confirmed_at=?1, confirm_token=NULL, unsubscribed_at=NULL WHERE id=?2",
-                rusqlite::params![now, id],
-            )?;
-            Ok(AddOutcome::Reactivated)
-        }
-        None => {
-            conn.execute(
-                "INSERT INTO subscribers (email, status, confirm_token, unsubscribe_token, created_at, confirmed_at, ip)
-                 VALUES (?1, 'confirmed', NULL, ?2, ?3, ?3, 'admin')",
-                rusqlite::params![email, unsubscribe_token, now],
-            )?;
-            Ok(AddOutcome::Added)
-        }
-    }
-}
-
-/// The stored HTML of a recorded send, for viewing.
-pub fn sent_html(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
-    conn.query_row("SELECT body_html FROM sends WHERE id = ?", [id], |r| r.get::<_, Option<String>>(0))
-        .optional()
-        .map(|o| o.flatten())
-}
-
-/// Existing subscriber lookup result: (id, status).
-pub fn find_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option<(i64, String)>> {
+pub fn find_by_email(conn: &Connection, email: &str, list: &str) -> rusqlite::Result<Option<(i64, String)>> {
     conn.query_row(
-        "SELECT id, status FROM subscribers WHERE email = ? COLLATE NOCASE",
-        [email],
+        "SELECT id, status FROM subscribers WHERE email = ?1 COLLATE NOCASE AND list = ?2",
+        rusqlite::params![email, list],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
     )
     .optional()
 }
 
-/// Reset an existing row back to pending with a fresh confirm token.
 pub fn set_pending(conn: &Connection, id: i64, confirm_token: &str, ip: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE subscribers
-            SET status = 'pending', confirm_token = ?1, unsubscribed_at = NULL, ip = ?2
-          WHERE id = ?3",
+        "UPDATE subscribers SET status='pending', confirm_token=?1, unsubscribed_at=NULL, ip=?2 WHERE id=?3",
         rusqlite::params![confirm_token, ip, id],
     )?;
     Ok(())
 }
 
-/// Insert a brand-new pending subscriber.
-pub fn insert_pending(
-    conn: &Connection,
-    email: &str,
-    confirm_token: &str,
-    unsubscribe_token: &str,
-    now: i64,
-    ip: &str,
-) -> rusqlite::Result<()> {
+pub fn insert_pending(conn: &Connection, email: &str, confirm_token: &str, unsubscribe_token: &str, now: i64, ip: &str, list: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO subscribers (email, status, confirm_token, unsubscribe_token, created_at, ip)
-         VALUES (?1, 'pending', ?2, ?3, ?4, ?5)",
-        rusqlite::params![email, confirm_token, unsubscribe_token, now, ip],
+        "INSERT INTO subscribers (email, status, confirm_token, unsubscribe_token, created_at, ip, list)
+         VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![email, confirm_token, unsubscribe_token, now, ip, list],
     )?;
     Ok(())
 }
 
-/// Confirm a pending subscriber by confirm token. Returns true if one was confirmed.
 pub fn confirm(conn: &Connection, token: &str, now: i64) -> rusqlite::Result<bool> {
     let n = conn.execute(
-        "UPDATE subscribers
-            SET status = 'confirmed', confirmed_at = ?1, confirm_token = NULL
-          WHERE confirm_token = ?2",
+        "UPDATE subscribers SET status='confirmed', confirmed_at=?1, confirm_token=NULL WHERE confirm_token=?2",
         rusqlite::params![now, token],
     )?;
     Ok(n > 0)
 }
 
-/// Outcome of an unsubscribe attempt.
-pub enum UnsubOutcome {
-    Done,
-    Already,
-    NotFound,
-}
-
-/// Unsubscribe by opaque token (from an email link).
 pub fn unsubscribe_by_token(conn: &Connection, token: &str, now: i64) -> rusqlite::Result<UnsubOutcome> {
     let row = conn
         .query_row(
@@ -171,10 +163,10 @@ pub fn unsubscribe_by_token(conn: &Connection, token: &str, now: i64) -> rusqlit
         .optional()?;
     match row {
         None => Ok(UnsubOutcome::NotFound),
-        Some((_, status)) if status == "unsubscribed" => Ok(UnsubOutcome::Already),
+        Some((_, s)) if s == "unsubscribed" => Ok(UnsubOutcome::Already),
         Some((id, _)) => {
             conn.execute(
-                "UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ?1 WHERE id = ?2",
+                "UPDATE subscribers SET status='unsubscribed', unsubscribed_at=?1 WHERE id=?2",
                 rusqlite::params![now, id],
             )?;
             Ok(UnsubOutcome::Done)
@@ -182,25 +174,44 @@ pub fn unsubscribe_by_token(conn: &Connection, token: &str, now: i64) -> rusqlit
     }
 }
 
-/// Admin: unsubscribe by email address. Returns rows affected.
-pub fn unsubscribe_by_email(conn: &Connection, email: &str, now: i64) -> rusqlite::Result<usize> {
+pub fn unsubscribe_by_email(conn: &Connection, email: &str, now: i64, list: &str) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE subscribers SET status = 'unsubscribed', unsubscribed_at = ?1
-          WHERE email = ?2 COLLATE NOCASE AND status != 'unsubscribed'",
-        rusqlite::params![now, email],
+        "UPDATE subscribers SET status='unsubscribed', unsubscribed_at=?1
+          WHERE email=?2 COLLATE NOCASE AND list=?3 AND status!='unsubscribed'",
+        rusqlite::params![now, email, list],
     )
 }
 
-/// Admin: hard-delete by email. Returns rows affected.
-pub fn delete_by_email(conn: &Connection, email: &str) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM subscribers WHERE email = ? COLLATE NOCASE", [email])
+pub fn delete_by_email(conn: &Connection, email: &str, list: &str) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM subscribers WHERE email=?1 COLLATE NOCASE AND list=?2", rusqlite::params![email, list])
 }
 
-/// Aggregate status counts.
-pub fn stats(conn: &Connection) -> rusqlite::Result<Stats> {
+/// Manually add a subscriber as already-confirmed for a list.
+pub fn add_confirmed(conn: &Connection, email: &str, unsubscribe_token: &str, now: i64, list: &str) -> rusqlite::Result<AddOutcome> {
+    match find_by_email(conn, email, list)? {
+        Some((_, status)) if status == "confirmed" => Ok(AddOutcome::AlreadyConfirmed),
+        Some((id, _)) => {
+            conn.execute(
+                "UPDATE subscribers SET status='confirmed', confirmed_at=?1, confirm_token=NULL, unsubscribed_at=NULL WHERE id=?2",
+                rusqlite::params![now, id],
+            )?;
+            Ok(AddOutcome::Reactivated)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO subscribers (email, status, confirm_token, unsubscribe_token, created_at, confirmed_at, ip, list)
+                 VALUES (?1, 'confirmed', NULL, ?2, ?3, ?3, 'admin', ?4)",
+                rusqlite::params![email, unsubscribe_token, now, list],
+            )?;
+            Ok(AddOutcome::Added)
+        }
+    }
+}
+
+pub fn stats(conn: &Connection, list: &str) -> rusqlite::Result<Stats> {
     let mut s = Stats::default();
-    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM subscribers GROUP BY status")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM subscribers WHERE list=? GROUP BY status")?;
+    let rows = stmt.query_map([list], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     for row in rows {
         let (status, count) = row?;
         match status.as_str() {
@@ -214,13 +225,12 @@ pub fn stats(conn: &Connection) -> rusqlite::Result<Stats> {
     Ok(s)
 }
 
-/// Most-recent subscribers (capped), newest first.
-pub fn recent_subscribers(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<Subscriber>> {
+pub fn recent_subscribers(conn: &Connection, limit: i64, list: &str) -> rusqlite::Result<Vec<Subscriber>> {
     let mut stmt = conn.prepare(
         "SELECT email, status, created_at, confirmed_at, unsubscribed_at
-           FROM subscribers ORDER BY created_at DESC LIMIT ?",
+           FROM subscribers WHERE list=?1 ORDER BY created_at DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map([limit], |r| {
+    let rows = stmt.query_map(rusqlite::params![list, limit], |r| {
         Ok(Subscriber {
             email: r.get(0)?,
             status: r.get(1)?,
@@ -232,21 +242,19 @@ pub fn recent_subscribers(conn: &Connection, limit: i64) -> rusqlite::Result<Vec
     rows.collect()
 }
 
-/// Confirmed subscribers for a send: (email, unsubscribe_token).
-pub fn confirmed_recipients(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+pub fn confirmed_recipients(conn: &Connection, list: &str) -> rusqlite::Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT email, unsubscribe_token FROM subscribers WHERE status = 'confirmed' ORDER BY id",
+        "SELECT email, unsubscribe_token FROM subscribers WHERE list=? AND status='confirmed' ORDER BY id",
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([list], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     rows.collect()
 }
 
-/// Recent send history.
-pub fn recent_sends(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<SendRecord>> {
+pub fn recent_sends(conn: &Connection, limit: i64, list: &str) -> rusqlite::Result<Vec<SendRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT id, post_url, subject, sent_at, recipient_count FROM sends ORDER BY sent_at DESC LIMIT ?",
+        "SELECT id, post_url, subject, sent_at, recipient_count FROM sends WHERE list=?1 ORDER BY sent_at DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map([limit], |r| {
+    let rows = stmt.query_map(rusqlite::params![list, limit], |r| {
         Ok(SendRecord {
             id: r.get(0)?,
             post_url: r.get(1)?,
@@ -258,21 +266,25 @@ pub fn recent_sends(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<SendR
     rows.collect()
 }
 
-/// Whether a post URL was already sent.
-pub fn last_send_at(conn: &Connection, post_url: &str) -> rusqlite::Result<Option<i64>> {
+pub fn last_send_at(conn: &Connection, post_url: &str, list: &str) -> rusqlite::Result<Option<i64>> {
     conn.query_row(
-        "SELECT sent_at FROM sends WHERE post_url = ? ORDER BY sent_at DESC LIMIT 1",
-        [post_url],
+        "SELECT sent_at FROM sends WHERE post_url=?1 AND list=?2 ORDER BY sent_at DESC LIMIT 1",
+        rusqlite::params![post_url, list],
         |r| r.get::<_, i64>(0),
     )
     .optional()
 }
 
-/// Record a completed send, storing a representative copy of the email HTML.
-pub fn record_send(conn: &Connection, post_url: &str, subject: &str, now: i64, count: i64, body_html: &str) -> rusqlite::Result<()> {
+pub fn record_send(conn: &Connection, post_url: &str, subject: &str, now: i64, count: i64, body_html: &str, list: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO sends (post_url, subject, sent_at, recipient_count, body_html) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![post_url, subject, now, count, body_html],
+        "INSERT INTO sends (post_url, subject, sent_at, recipient_count, body_html, list) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![post_url, subject, now, count, body_html, list],
     )?;
     Ok(())
+}
+
+pub fn sent_html(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT body_html FROM sends WHERE id = ?", [id], |r| r.get::<_, Option<String>>(0))
+        .optional()
+        .map(|o| o.flatten())
 }

@@ -1,21 +1,15 @@
-//! Newsletter service for stephens.page/blog (Rust/Axum).
+//! Multi-list newsletter service for Jacob Stephens' blogs (Rust/Axum).
 //!
-//! Public endpoints (behind Apache at https://newsletter.stephens.page):
-//!   POST /subscribe          double opt-in: Turnstile + honeypot + rate-limit, mails a confirm link
-//!   GET  /confirm?token=      confirm a pending subscriber
-//!   GET  /unsubscribe?token=  opt-out landing page
-//!   POST /unsubscribe?token=  RFC 8058 one-click unsubscribe
+//! One service backs several blogs via a `list` key (default "stephens", also
+//! "personal"). Subscribers and sends are scoped per list; confirm/unsubscribe
+//! links and all sends go through newsletter.stephens.page.
 //!
-//! Admin endpoints (require the NEWSLETTER_ADMIN_TOKEN bearer/header; used by the dashboard):
-//!   GET  /admin/subscribers   stats + recent subscribers + send history (JSON)
-//!   POST /admin/unsubscribe   {email}
-//!   POST /admin/delete        {email}
-//!   POST /admin/send          {slug, force?}  -> sends a post to confirmed subscribers
+//! Public: GET / (subscribe page), POST /subscribe, GET /confirm, GET|POST /unsubscribe, GET /health.
+//! Admin (bearer NEWSLETTER_ADMIN_TOKEN): /admin/{subscribers,add,unsubscribe,delete,send,posts,sent,
+//!   compose,preview,send_html} — all list-aware.
+//! CLI: `newsletter send <slug> [--list <list>] [--force]`.
 //!
-//! CLI: `newsletter send <slug> [--force]` runs a send from the shell.
-//!
-//! The Resend API key comes from the environment (RESEND_API_KEY, or SMTP_PASS injected
-//! by secret-env from the shared fleet secret) - no private copy of the key.
+//! The Resend key comes from env (RESEND_API_KEY, or SMTP_PASS via secret-env).
 
 mod db;
 mod mail;
@@ -28,26 +22,61 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tower_http::cors::CorsLayer;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tower_http::cors::CorsLayer;
 
 pub struct Config {
     pub addr: String,
     pub db_path: String,
     pub public_url: String,
-    pub blog_url: String,
-    pub blog_dir: String,
     pub resend_key: String,
     pub turnstile_secret: String,
     pub turnstile_sitekey: String,
     pub admin_token: String,
-    pub from_email: String,
-    pub from_name: String,
+}
+
+/// Per-list settings: which blog, sender identity, and where posts live.
+pub struct ListCfg {
+    pub key: &'static str,
+    pub display: &'static str,
+    pub from_email: &'static str,
+    pub from_name: &'static str,
+    pub blog_dir: &'static str,
+    pub blog_url: &'static str,
+}
+
+/// Normalize an arbitrary list string to a known list key.
+pub fn valid_list(list: &str) -> &'static str {
+    match list {
+        "personal" => "personal",
+        _ => "stephens",
+    }
+}
+
+pub fn list_cfg(list: &str) -> ListCfg {
+    match valid_list(list) {
+        "personal" => ListCfg {
+            key: "personal",
+            display: "Jacob Stephens (personal blog)",
+            from_email: "jacob@stephens.page",
+            from_name: "Jacob Stephens",
+            blog_dir: "/var/www/blog.stephens.page/posts",
+            blog_url: "https://jacobstephens.net/posts",
+        },
+        _ => ListCfg {
+            key: "stephens",
+            display: "Jacob Stephens' blog",
+            from_email: "jacob@stephens.page",
+            from_name: "Jacob Stephens",
+            blog_dir: "/var/www/stephens.page/blog",
+            blog_url: "https://stephens.page/blog",
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -58,13 +87,6 @@ pub struct AppState {
     pub rl: Arc<Mutex<HashMap<String, Vec<i64>>>>,
 }
 
-impl AppState {
-    fn from(&self) -> String {
-        format!("{} <{}>", self.cfg.from_name, self.cfg.from_email)
-    }
-}
-
-/// Seconds since the Unix epoch.
 pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,8 +107,7 @@ fn valid_email(e: &str) -> bool {
     }
     match e.find('@') {
         Some(at) => {
-            let local = &e[..at];
-            let domain = &e[at + 1..];
+            let (local, domain) = (&e[..at], &e[at + 1..]);
             !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
         }
         None => false,
@@ -122,7 +143,6 @@ async fn turnstile_ok(http: &reqwest::Client, secret: &str, token: &str, ip: &st
     }
 }
 
-/// Per-IP: at most 5 subscribe attempts per hour.
 fn rate_ok(state: &AppState, ip: &str) -> bool {
     let mut rl = state.rl.lock().unwrap();
     let n = now();
@@ -159,8 +179,15 @@ fn admin_ok(headers: &HeaderMap, token: &str) -> bool {
 
 // ---------- Public handlers ----------
 
-async fn index(State(state): State<AppState>) -> Html<String> {
-    Html(mail::subscribe_page(&state.cfg.turnstile_sitekey))
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(default)]
+    list: String,
+}
+
+async fn index(State(state): State<AppState>, Query(q): Query<ListQuery>) -> Html<String> {
+    let lc = list_cfg(&q.list);
+    Html(mail::subscribe_page(&state.cfg.turnstile_sitekey, lc.key, lc.display))
 }
 
 #[derive(Deserialize)]
@@ -171,16 +198,17 @@ struct SubscribeForm {
     website_url: String,
     #[serde(default, rename = "cf-turnstile-response")]
     turnstile: String,
+    #[serde(default)]
+    list: String,
 }
 
 async fn subscribe(State(state): State<AppState>, headers: HeaderMap, Form(form): Form<SubscribeForm>) -> Response {
     let ip = client_ip(&headers);
+    let list = valid_list(&form.list);
 
-    // Honeypot: pretend success, do nothing.
     if !form.website_url.trim().is_empty() {
         return jok("Thanks! Please check your email to confirm.");
     }
-
     let email = form.email.trim().to_string();
     if email.is_empty() {
         return jerr(StatusCode::OK, "Please enter your email address.");
@@ -204,7 +232,7 @@ async fn subscribe(State(state): State<AppState>, headers: HeaderMap, Form(form)
     let confirm_token = token();
     {
         let conn = state.db.lock().unwrap();
-        match db::find_by_email(&conn, &email) {
+        match db::find_by_email(&conn, &email, list) {
             Ok(Some((_, status))) if status == "confirmed" => {
                 return jok("You're already subscribed - thanks for reading.");
             }
@@ -214,7 +242,7 @@ async fn subscribe(State(state): State<AppState>, headers: HeaderMap, Form(form)
                 }
             }
             Ok(None) => {
-                if db::insert_pending(&conn, &email, &confirm_token, &token(), now(), &ip).is_err() {
+                if db::insert_pending(&conn, &email, &confirm_token, &token(), now(), &ip, list).is_err() {
                     return jerr(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our end. Please try again later.");
                 }
             }
@@ -225,25 +253,16 @@ async fn subscribe(State(state): State<AppState>, headers: HeaderMap, Form(form)
         }
     }
 
+    let lc = list_cfg(list);
     let confirm_url = format!("{}/confirm?token={}", state.cfg.public_url.trim_end_matches('/'), confirm_token);
-    let (html, text) = mail::confirm_email(&confirm_url);
-    let from = state.from();
-    if let Err(e) = mail::send(
-        &state.http,
-        &state.cfg.resend_key,
-        &from,
-        &email,
-        "Confirm your subscription to Jacob Stephens' blog",
-        &html,
-        &text,
-        &HashMap::new(),
-    )
-    .await
+    let (html, text) = mail::confirm_email(&confirm_url, lc.display);
+    let from = format!("{} <{}>", lc.from_name, lc.from_email);
+    if let Err(e) = mail::send(&state.http, &state.cfg.resend_key, &from, &email,
+        &format!("Confirm your subscription to {}", lc.display), &html, &text, &HashMap::new()).await
     {
         tracing::error!("confirm send failed: {e}");
         return jerr(StatusCode::BAD_GATEWAY, "We could not send the confirmation email. Please try again later.");
     }
-
     jok("Almost there - check your email and click the confirmation link.")
 }
 
@@ -255,81 +274,45 @@ struct TokenQuery {
 
 async fn confirm(State(state): State<AppState>, Query(q): Query<TokenQuery>) -> Response {
     if !hexish(&q.token) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(mail::landing_page(
-                "Invalid link",
-                "That link doesn't look right",
-                "<p>The confirmation link is missing or malformed. Try subscribing again from the blog.</p>",
-            )),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Html(mail::landing_page("Invalid link", "That link doesn't look right",
+            "<p>The confirmation link is missing or malformed. Try subscribing again from the blog.</p>"))).into_response();
     }
     let res = {
         let conn = state.db.lock().unwrap();
         db::confirm(&conn, &q.token, now())
     };
     match res {
-        Ok(true) => Html(mail::landing_page(
-            "Subscription confirmed",
-            "You're subscribed",
+        Ok(true) => Html(mail::landing_page("Subscription confirmed", "You're subscribed",
             "<p>Thanks for confirming. You'll get an email when I publish a new post - nothing else.</p>\
-             <p>Every email includes a one-click unsubscribe link if you ever change your mind.</p>",
-        ))
-        .into_response(),
-        Ok(false) => Html(mail::landing_page(
-            "Already confirmed",
-            "You're all set",
-            "<p>This link has already been used. If you've confirmed once, you're subscribed - nothing more to do.</p>",
-        ))
-        .into_response(),
+             <p>Every email includes a one-click unsubscribe link if you ever change your mind.</p>")).into_response(),
+        Ok(false) => Html(mail::landing_page("Already confirmed", "You're all set",
+            "<p>This link has already been used. If you've confirmed once, you're subscribed - nothing more to do.</p>")).into_response(),
         Err(e) => {
             tracing::error!("confirm error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(mail::landing_page("Something went wrong", "Something went wrong", "<p>We couldn't confirm your subscription just now. Please try the link again shortly.</p>")),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Html(mail::landing_page("Something went wrong", "Something went wrong",
+                "<p>We couldn't confirm your subscription just now. Please try the link again shortly.</p>"))).into_response()
         }
     }
 }
 
 async fn unsubscribe_get(State(state): State<AppState>, Query(q): Query<TokenQuery>) -> Response {
     if !hexish(&q.token) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Html(mail::landing_page(
-                "Invalid link",
-                "That link doesn't look right",
-                "<p>The unsubscribe link is missing or malformed. Email <a href=\"mailto:jacob@stephens.page\">jacob@stephens.page</a> and I'll remove you.</p>",
-            )),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Html(mail::landing_page("Invalid link", "That link doesn't look right",
+            "<p>The unsubscribe link is missing or malformed. Email <a href=\"mailto:jacob@stephens.page\">jacob@stephens.page</a> and I'll remove you.</p>"))).into_response();
     }
     let outcome = {
         let conn = state.db.lock().unwrap();
         db::unsubscribe_by_token(&conn, &q.token, now())
     };
     match outcome {
-        Ok(db::UnsubOutcome::NotFound) => Html(mail::landing_page(
-            "Not found",
-            "We couldn't find that subscription",
-            "<p>This link doesn't match anyone on the list. You may already be removed.</p>",
-        ))
-        .into_response(),
-        Ok(_) => Html(mail::landing_page(
-            "Unsubscribed",
-            "You've been unsubscribed",
-            "<p>You won't receive any more newsletter emails. Sorry to see you go - you're welcome back anytime from the blog.</p>",
-        ))
-        .into_response(),
+        Ok(db::UnsubOutcome::NotFound) => Html(mail::landing_page("Not found", "We couldn't find that subscription",
+            "<p>This link doesn't match anyone on the list. You may already be removed.</p>")).into_response(),
+        Ok(_) => Html(mail::landing_page("Unsubscribed", "You've been unsubscribed",
+            "<p>You won't receive any more newsletter emails. Sorry to see you go - you're welcome back anytime from the blog.</p>")).into_response(),
         Err(e) => {
             tracing::error!("unsubscribe error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(mail::landing_page("Something went wrong", "Something went wrong", "<p>We couldn't process that just now. Please try again shortly.</p>")),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Html(mail::landing_page("Something went wrong", "Something went wrong",
+                "<p>We couldn't process that just now. Please try again shortly.</p>"))).into_response()
         }
     }
 }
@@ -342,35 +325,63 @@ async fn unsubscribe_post(State(state): State<AppState>, Query(q): Query<TokenQu
     (StatusCode::OK, "OK").into_response()
 }
 
-// ---------- Admin handlers ----------
+// ---------- Admin handlers (all list-aware) ----------
 
-async fn admin_data(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn admin_data(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> Response {
     if !admin_ok(&headers, &state.cfg.admin_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
+    let list = valid_list(&q.list);
     let conn = state.db.lock().unwrap();
-    let stats = match db::stats(&conn) {
+    let stats = match db::stats(&conn, list) {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
-    let subscribers = db::recent_subscribers(&conn, 1000).unwrap_or_default();
-    let sends = db::recent_sends(&conn, 50).unwrap_or_default();
-    Json(json!({"stats": stats, "subscribers": subscribers, "sends": sends})).into_response()
+    let subscribers = db::recent_subscribers(&conn, 1000, list).unwrap_or_default();
+    let sends = db::recent_sends(&conn, 50, list).unwrap_or_default();
+    Json(json!({"list": list, "stats": stats, "subscribers": subscribers, "sends": sends})).into_response()
 }
 
 #[derive(Deserialize)]
 struct EmailBody {
     #[serde(default)]
     email: String,
+    #[serde(default)]
+    list: String,
+}
+
+async fn admin_add(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<EmailBody>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+    let list = valid_list(&body.list);
+    let email = body.email.trim().to_string();
+    if !valid_email(&email) {
+        return jerr(StatusCode::BAD_REQUEST, "Please enter a valid email address.");
+    }
+    let outcome = {
+        let conn = state.db.lock().unwrap();
+        db::add_confirmed(&conn, &email, &token(), now(), list)
+    };
+    match outcome {
+        Ok(db::AddOutcome::AlreadyConfirmed) => Json(json!({"ok": true, "message": format!("{email} is already subscribed.")})).into_response(),
+        Ok(db::AddOutcome::Reactivated) => Json(json!({"ok": true, "message": format!("Re-added {email} as confirmed.")})).into_response(),
+        Ok(db::AddOutcome::Added) => Json(json!({"ok": true, "message": format!("Added {email} as confirmed.")})).into_response(),
+        Err(e) => {
+            tracing::error!("admin add: {e}");
+            jerr(StatusCode::INTERNAL_SERVER_ERROR, "Could not add subscriber.")
+        }
+    }
 }
 
 async fn admin_unsub(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<EmailBody>) -> Response {
     if !admin_ok(&headers, &state.cfg.admin_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
+    let list = valid_list(&body.list);
     let n = {
         let conn = state.db.lock().unwrap();
-        db::unsubscribe_by_email(&conn, body.email.trim(), now()).unwrap_or(0)
+        db::unsubscribe_by_email(&conn, body.email.trim(), now(), list).unwrap_or(0)
     };
     Json(json!({"ok": true, "affected": n})).into_response()
 }
@@ -379,9 +390,10 @@ async fn admin_delete(State(state): State<AppState>, headers: HeaderMap, Json(bo
     if !admin_ok(&headers, &state.cfg.admin_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
+    let list = valid_list(&body.list);
     let n = {
         let conn = state.db.lock().unwrap();
-        db::delete_by_email(&conn, body.email.trim()).unwrap_or(0)
+        db::delete_by_email(&conn, body.email.trim(), list).unwrap_or(0)
     };
     Json(json!({"ok": true, "affected": n})).into_response()
 }
@@ -392,12 +404,15 @@ struct SlugBody {
     slug: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    list: String,
 }
 
 async fn admin_send(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<SlugBody>) -> Response {
     if !admin_ok(&headers, &state.cfg.admin_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
+    let list = valid_list(&body.list).to_string();
     let slug = body.slug.trim().to_string();
     if slug.is_empty() {
         return jerr(StatusCode::BAD_REQUEST, "Missing slug.");
@@ -405,26 +420,62 @@ async fn admin_send(State(state): State<AppState>, headers: HeaderMap, Json(body
     let st = state.clone();
     let force = body.force;
     let slug2 = slug.clone();
+    let l2 = list.clone();
     tokio::spawn(async move {
-        match send::send_post(&st, &slug2, force).await {
-            Ok(r) => tracing::info!("send {slug2}: sent {}, failed {} of {}", r.sent, r.failed, r.recipients),
-            Err(e) => tracing::error!("send {slug2} failed: {e}"),
+        match send::send_post(&st, &l2, &slug2, force).await {
+            Ok(r) => tracing::info!("send [{l2}] {slug2}: sent {}, failed {} of {}", r.sent, r.failed, r.recipients),
+            Err(e) => tracing::error!("send [{l2}] {slug2} failed: {e}"),
         }
     });
     Json(json!({"ok": true, "started": true, "message": format!("Sending \"{slug}\" to confirmed subscribers.")})).into_response()
+}
+
+async fn admin_posts(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<ListQuery>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+    let lc = list_cfg(&q.list);
+    let posts: Vec<_> = send::list_posts(&lc)
+        .into_iter()
+        .map(|(slug, title)| json!({"slug": slug, "title": title}))
+        .collect();
+    Json(json!({"posts": posts})).into_response()
+}
+
+#[derive(Deserialize)]
+struct IdQuery {
+    #[serde(default)]
+    id: i64,
+}
+
+async fn admin_sent(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<IdQuery>) -> Response {
+    if !admin_ok(&headers, &state.cfg.admin_token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let html = {
+        let conn = state.db.lock().unwrap();
+        db::sent_html(&conn, q.id).ok().flatten()
+    };
+    match html {
+        Some(h) => Html(h).into_response(),
+        None => (StatusCode::NOT_FOUND, Html("<p style=\"font-family:sans-serif\">No stored copy of that email.</p>".to_string())).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
 struct ComposeSeedBody {
     #[serde(default)]
     slug: String,
+    #[serde(default)]
+    list: String,
 }
 
 async fn admin_compose(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<ComposeSeedBody>) -> Response {
     if !admin_ok(&headers, &state.cfg.admin_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
-    match send::read_post(&state.cfg, &body.slug) {
+    let lc = list_cfg(&body.list);
+    match send::read_post(&lc, &body.slug) {
         Ok((_slug, title, desc, post_url)) => {
             let seed = send::seed_body(&title, &desc, &post_url);
             Json(json!({"ok": true, "subject": title, "body_html": seed})).into_response()
@@ -456,12 +507,15 @@ struct SendHtmlBody {
     body_html: String,
     #[serde(default)]
     test_email: String,
+    #[serde(default)]
+    list: String,
 }
 
 async fn admin_send_html(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<SendHtmlBody>) -> Response {
     if !admin_ok(&headers, &state.cfg.admin_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
+    let list = valid_list(&body.list).to_string();
     if body.subject.trim().is_empty() {
         return jerr(StatusCode::BAD_REQUEST, "Subject is required.");
     }
@@ -473,7 +527,7 @@ async fn admin_send_html(State(state): State<AppState>, headers: HeaderMap, Json
         if !valid_email(&test) {
             return jerr(StatusCode::BAD_REQUEST, "Invalid test address.");
         }
-        return match send::send_test(&state, &body.subject, &body.body_html, &test).await {
+        return match send::send_test(&state, &list, &body.subject, &body.body_html, &test).await {
             Ok(_) => Json(json!({"ok": true, "message": format!("Test email sent to {test}.")})).into_response(),
             Err(e) => jerr(StatusCode::BAD_GATEWAY, &format!("Test send failed: {e}")),
         };
@@ -482,85 +536,25 @@ async fn admin_send_html(State(state): State<AppState>, headers: HeaderMap, Json
     let subject = body.subject.clone();
     let bh = body.body_html.clone();
     tokio::spawn(async move {
-        match send::send_custom(&st, &subject, &bh).await {
-            Ok(r) => tracing::info!("compose send '{}': sent {}, failed {} of {}", subject, r.sent, r.failed, r.recipients),
+        match send::send_custom(&st, &list, &subject, &bh).await {
+            Ok(r) => tracing::info!("compose send [{list}] '{}': sent {}, failed {} of {}", subject, r.sent, r.failed, r.recipients),
             Err(e) => tracing::error!("compose send failed: {e}"),
         }
     });
     Json(json!({"ok": true, "started": true, "message": "Sending to confirmed subscribers."})).into_response()
 }
 
-async fn admin_add(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<EmailBody>) -> Response {
-    if !admin_ok(&headers, &state.cfg.admin_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
-    }
-    let email = body.email.trim().to_string();
-    if !valid_email(&email) {
-        return jerr(StatusCode::BAD_REQUEST, "Please enter a valid email address.");
-    }
-    let outcome = {
-        let conn = state.db.lock().unwrap();
-        db::add_confirmed(&conn, &email, &token(), now())
-    };
-    match outcome {
-        Ok(db::AddOutcome::AlreadyConfirmed) => Json(json!({"ok": true, "message": format!("{email} is already subscribed.")})).into_response(),
-        Ok(db::AddOutcome::Reactivated) => Json(json!({"ok": true, "message": format!("Re-added {email} as confirmed.")})).into_response(),
-        Ok(db::AddOutcome::Added) => Json(json!({"ok": true, "message": format!("Added {email} as confirmed.")})).into_response(),
-        Err(e) => {
-            tracing::error!("admin add: {e}");
-            jerr(StatusCode::INTERNAL_SERVER_ERROR, "Could not add subscriber.")
-        }
-    }
-}
-
-async fn admin_posts(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !admin_ok(&headers, &state.cfg.admin_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
-    }
-    let posts: Vec<_> = send::list_posts(&state.cfg)
-        .into_iter()
-        .map(|(slug, title)| json!({"slug": slug, "title": title}))
-        .collect();
-    Json(json!({"posts": posts})).into_response()
-}
-
-#[derive(Deserialize)]
-struct IdQuery {
-    #[serde(default)]
-    id: i64,
-}
-
-async fn admin_sent(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<IdQuery>) -> Response {
-    if !admin_ok(&headers, &state.cfg.admin_token) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
-    let html = {
-        let conn = state.db.lock().unwrap();
-        db::sent_html(&conn, q.id).ok().flatten()
-    };
-    match html {
-        Some(h) => Html(h).into_response(),
-        None => (StatusCode::NOT_FOUND, Html("<p style=\"font-family:sans-serif\">No stored copy of that email.</p>".to_string())).into_response(),
-    }
-}
-
 fn config_from_env() -> Config {
     let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let resend = std::env::var("RESEND_API_KEY")
-        .or_else(|_| std::env::var("SMTP_PASS"))
-        .unwrap_or_default();
+    let resend = std::env::var("RESEND_API_KEY").or_else(|_| std::env::var("SMTP_PASS")).unwrap_or_default();
     Config {
         addr: get("NEWSLETTER_ADDR", "127.0.0.1:3462"),
         db_path: get("NEWSLETTER_DB", "/var/lib/stephens-newsletter/newsletter.sqlite"),
         public_url: get("NEWSLETTER_PUBLIC_URL", "https://newsletter.stephens.page"),
-        blog_url: get("NEWSLETTER_BLOG_URL", "https://stephens.page/blog"),
-        blog_dir: get("NEWSLETTER_BLOG_DIR", "/var/www/stephens.page/blog"),
         resend_key: resend,
         turnstile_secret: get("TURNSTILE_SECRET", ""),
         turnstile_sitekey: get("TURNSTILE_SITE_KEY", "0x4AAAAAADk4Vi9kg773i1pu"),
         admin_token: get("NEWSLETTER_ADMIN_TOKEN", ""),
-        from_email: get("NEWSLETTER_FROM_EMAIL", "jacob@stephens.page"),
-        from_name: get("NEWSLETTER_FROM_NAME", "Jacob Stephens"),
     }
 }
 
@@ -583,21 +577,37 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // CLI: `newsletter send <slug> [--force]`
+    // CLI: `newsletter send <slug> [--list <list>] [--force]`
     if args.get(1).map(String::as_str) == Some("send") {
         let cfg = config_from_env();
-        let force = args.iter().any(|a| a == "--force");
-        let slug = args.iter().skip(2).find(|a| !a.starts_with("--"));
+        let mut list = "stephens".to_string();
+        let mut slug: Option<String> = None;
+        let mut force = false;
+        let mut it = args.iter().skip(2).peekable();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--force" => force = true,
+                "--list" => {
+                    if let Some(v) = it.next() {
+                        list = valid_list(v).to_string();
+                    }
+                }
+                s if !s.starts_with("--") => {
+                    if slug.is_none() {
+                        slug = Some(s.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
         let Some(slug) = slug else {
-            eprintln!("usage: newsletter send <slug> [--force]");
+            eprintln!("usage: newsletter send <slug> [--list stephens|personal] [--force]");
             std::process::exit(2);
         };
         let state = build_state(cfg)?;
-        match send::send_post(&state, slug, force).await {
+        match send::send_post(&state, &list, &slug, force).await {
             Ok(r) => {
-                println!("Subject: {}", r.subject);
-                println!("Recipients: {}", r.recipients);
-                println!("Sent {}, failed {}.", r.sent, r.failed);
+                println!("List: {list}\nSubject: {}\nRecipients: {}\nSent {}, failed {}.", r.subject, r.recipients, r.sent, r.failed);
                 std::process::exit(if r.failed > 0 { 1 } else { 0 });
             }
             Err(e) => {
@@ -617,10 +627,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = build_state(cfg)?;
 
-    // The subscribe form lives on stephens.page and fetch()es this service on a
-    // different subdomain, so the browser needs CORS to read the JSON response.
     let cors = CorsLayer::new()
-        .allow_origin("https://stephens.page".parse::<HeaderValue>().unwrap())
+        .allow_origin([
+            "https://stephens.page".parse::<HeaderValue>().unwrap(),
+            "https://jacobstephens.net".parse::<HeaderValue>().unwrap(),
+            "https://blog.stephens.page".parse::<HeaderValue>().unwrap(),
+        ])
         .allow_methods([Method::GET, Method::POST]);
 
     let app = Router::new()
@@ -633,12 +645,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/unsubscribe", post(admin_unsub))
         .route("/admin/delete", post(admin_delete))
         .route("/admin/send", post(admin_send))
-        .route("/admin/compose", post(admin_compose))
-        .route("/admin/preview", post(admin_preview))
-        .route("/admin/send_html", post(admin_send_html))
         .route("/admin/add", post(admin_add))
         .route("/admin/posts", get(admin_posts))
         .route("/admin/sent", get(admin_sent))
+        .route("/admin/compose", post(admin_compose))
+        .route("/admin/preview", post(admin_preview))
+        .route("/admin/send_html", post(admin_send_html))
         .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(cors)
         .with_state(state);

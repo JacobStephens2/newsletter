@@ -54,11 +54,12 @@ pub fn esc(s: &str) -> String {
 }
 
 /// Confirmation (double opt-in) email body.
-pub fn confirm_email(confirm_url: &str) -> (String, String) {
+pub fn confirm_email(confirm_url: &str, display: &str) -> (String, String) {
     let u = esc(confirm_url);
+    let d = esc(display);
     let html = format!(
         r#"<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:16px;line-height:1.6;color:#181512;max-width:520px;">
-  <p>Thanks for subscribing to <strong>Jacob Stephens' blog</strong>.</p>
+  <p>Thanks for subscribing to <strong>{d}</strong>.</p>
   <p>Please confirm your email address to start receiving new posts:</p>
   <p style="margin:24px 0;">
     <a href="{u}" style="background:#9b4d24;color:#fff;text-decoration:none;padding:11px 18px;border-radius:6px;font-weight:600;display:inline-block;">Confirm subscription</a>
@@ -68,7 +69,7 @@ pub fn confirm_email(confirm_url: &str) -> (String, String) {
 </div>"#
     );
     let text = format!(
-        "Thanks for subscribing to Jacob Stephens' blog.\n\nConfirm your email address to start receiving new posts:\n{confirm_url}\n\nIf you didn't request this, ignore this email and you won't be added."
+        "Thanks for subscribing to {display}.\n\nConfirm your email address to start receiving new posts:\n{confirm_url}\n\nIf you didn't request this, ignore this email and you won't be added."
     );
     (html, text)
 }
@@ -141,8 +142,10 @@ pub fn wrap_custom(body_html: &str, unsub_url: &str) -> (String, String) {
 }
 
 /// Standalone subscribe page served at the service root (newsletter.stephens.page/).
-pub fn subscribe_page(sitekey: &str) -> String {
+pub fn subscribe_page(sitekey: &str, list: &str, display: &str) -> String {
     let k = esc(sitekey);
+    let list = esc(list);
+    let d = esc(display);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -180,14 +183,15 @@ a{{color:var(--brand);}}
 </head>
 <body>
 <div class="card">
-  <div class="eyebrow">Jacob Stephens' blog</div>
+  <div class="eyebrow">{d}</div>
   <h1>Get new posts by email</h1>
-  <p class="lead">Occasional engineering writeups, sent when I publish. No spam, unsubscribe anytime.</p>
+  <p class="lead">Occasional writeups, sent when I publish. No spam, unsubscribe anytime.</p>
   <form id="f" novalidate>
     <div class="row">
       <input type="email" name="email" id="email" placeholder="you@example.com" autocomplete="email" required aria-label="Email address">
       <button type="submit" id="btn">Subscribe</button>
     </div>
+    <input type="hidden" name="list" value="{list}">
     <div class="hp" aria-hidden="true"><label>Leave this field empty<input type="text" name="website_url" tabindex="-1" autocomplete="off"></label></div>
     <div class="cf-turnstile" data-sitekey="{k}" data-theme="light"></div>
     <p class="status" id="status" role="status" aria-live="polite"></p>
